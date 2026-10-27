@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState } from "react";
+import { syncUserToSupabase } from "@/lib/supabase";
 
 export interface HostSubscription {
   status: "pending" | "active";
@@ -137,6 +138,11 @@ export default function DriverAuthModal({
         console.error("Failed to save session", e);
       }
     }
+
+    // Save to Supabase backend asynchronously
+    syncUserToSupabase(session).catch((err) =>
+      console.warn("Supabase user sync error:", err)
+    );
 
     onLoginSuccess(session);
     setWhatsappToast(null);

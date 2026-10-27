@@ -10,6 +10,14 @@ import DriverAuthModal, { UserSession, HostSubscription } from "@/components/dri
 import HostDashboard, { ChargerBookingRequest } from "@/components/host/HostDashboard";
 import HostSubscriptionView from "@/components/host/HostSubscriptionView";
 import SuperAdminDashboard from "@/components/superadmin/SuperAdminDashboard";
+import {
+  supabase,
+  fetchBookingRequestsFromSupabase,
+  saveBookingRequestToSupabase,
+  updateBookingRequestStatusInSupabase,
+  updateHostSubscriptionInSupabase,
+  fetchUserFromSupabase,
+} from "@/lib/supabase";
 
 export type DriverTab = "map" | "charge" | "activity" | "profile";
 
@@ -24,7 +32,7 @@ export default function HomePage() {
   const [activeStationName, setActiveStationName] = useState("GreenPulse Supercharger");
   const [activeStationKw, setActiveStationKw] = useState(180);
 
-  // Real-time booking requests from drivers to station host admin
+  // Real-time booking requests from drivers to station host admin (synced via Supabase)
   const [bookingRequests, setBookingRequests] = useState<ChargerBookingRequest[]>([
     {
       id: "req-init-101",
@@ -40,7 +48,7 @@ export default function HomePage() {
     },
   ]);
 
-  // Restore saved session from localStorage on client load
+  // Restore saved session & synchronize with Supabase backend
   useEffect(() => {
     if (typeof window !== "undefined") {
       try {
@@ -48,7 +56,6 @@ export default function HomePage() {
         if (saved) {
           const parsed = JSON.parse(saved) as UserSession;
           setCurrentUser(parsed);
-          // If the saved user is a host, let them view host role if preferred
           if (parsed.role === "host") {
             setCurrentRole("host");
           } else if (parsed.role === "superadmin") {
@@ -56,11 +63,69 @@ export default function HomePage() {
           } else {
             setCurrentRole("driver");
           }
+
+          // Fetch fresh profile state from Supabase
+          if (parsed.phone) {
+            fetchUserFromSupabase(parsed.phone).then((remoteUser) => {
+              if (remoteUser) {
+                setCurrentUser(remoteUser);
+                localStorage.setItem("voltspot_session", JSON.stringify(remoteUser));
+              }
+            });
+          }
         }
       } catch (e) {
         console.error("Error loading session", e);
       }
     }
+
+    // Fetch initial booking requests from Supabase
+    fetchBookingRequestsFromSupabase().then((remoteRequests) => {
+      if (remoteRequests && remoteRequests.length > 0) {
+        setBookingRequests(remoteRequests);
+      }
+    });
+
+    // Supabase Realtime channel for live booking alerts
+    const channel = supabase
+      .channel("voltspot-realtime-bookings")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "booking_requests" },
+        (payload) => {
+          if (payload.eventType === "INSERT") {
+            const row = payload.new as any;
+            const newReq: ChargerBookingRequest = {
+              id: row.id,
+              driverName: row.driver_name,
+              driverPhone: row.driver_phone,
+              vehicle: row.vehicle,
+              stationName: row.station_name,
+              bayId: row.bay_id,
+              connector: row.connector,
+              kw: row.kw,
+              timestamp: "Just now",
+              status: row.status,
+            };
+            setBookingRequests((prev) => {
+              if (prev.some((r) => r.id === newReq.id)) return prev;
+              return [newReq, ...prev];
+            });
+          } else if (payload.eventType === "UPDATE") {
+            const row = payload.new as any;
+            setBookingRequests((prev) =>
+              prev.map((r) =>
+                r.id === row.id ? { ...r, status: row.status } : r
+              )
+            );
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
   }, []);
 
   const handleStartCharge = (name: string, kw: number) => {
@@ -148,6 +213,11 @@ export default function HomePage() {
       status: "pending",
     };
     setBookingRequests((prev) => [newReq, ...prev]);
+
+    // Persist new booking request to Supabase
+    saveBookingRequestToSupabase(newReq).catch((err) =>
+      console.warn("Supabase booking insert error:", err)
+    );
   };
 
   // Host accepts booking request
@@ -156,6 +226,12 @@ export default function HomePage() {
       prev.map((r) => (r.id === id ? { ...r, status: "accepted" as const } : r))
     );
     const target = bookingRequests.find((r) => r.id === id);
+
+    // Update status in Supabase backend
+    updateBookingRequestStatusInSupabase(id, "accepted").catch((err) =>
+      console.warn("Supabase booking status update error:", err)
+    );
+
     alert(
       `🔒 Bay 02 Locked! Hardware connector reserved for ${
         target?.driverName || "driver"
@@ -168,6 +244,12 @@ export default function HomePage() {
     setBookingRequests((prev) =>
       prev.map((r) => (r.id === id ? { ...r, status: "declined" as const } : r))
     );
+
+    // Update status in Supabase backend
+    updateBookingRequestStatusInSupabase(id, "declined").catch((err) =>
+      console.warn("Supabase booking status update error:", err)
+    );
+
     alert("Charger request declined. Connector released to general pool.");
   };
 
@@ -182,6 +264,11 @@ export default function HomePage() {
       if (typeof window !== "undefined") {
         localStorage.setItem("voltspot_session", JSON.stringify(updated));
       }
+
+      // Persist active subscription to Supabase backend
+      updateHostSubscriptionInSupabase(currentUser.phone, sub).catch((err) =>
+        console.warn("Supabase subscription update error:", err)
+      );
     }
   };
 
@@ -192,19 +279,25 @@ export default function HomePage() {
     period: string
   ) => {
     if (currentUser?.role === "host") {
+      const newSub: HostSubscription = {
+        status,
+        plan: period.includes("Lifetime") ? "lifetime" : "yearly",
+        grantedBy: "superadmin",
+        validUntil: period,
+      };
       const updated: UserSession = {
         ...currentUser,
-        hostSubscription: {
-          status,
-          plan: period.includes("Lifetime") ? "lifetime" : "yearly",
-          grantedBy: "superadmin",
-          validUntil: period,
-        },
+        hostSubscription: newSub,
       };
       setCurrentUser(updated);
       if (typeof window !== "undefined") {
         localStorage.setItem("voltspot_session", JSON.stringify(updated));
       }
+
+      // Persist granted subscription to Supabase backend
+      updateHostSubscriptionInSupabase(currentUser.phone, newSub).catch((err) =>
+        console.warn("Supabase subscription update error:", err)
+      );
     }
   };
 

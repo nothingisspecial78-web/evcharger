@@ -45,6 +45,11 @@ export default function TopRoleNav({
             OCPP 2.0.1 Live
           </span>
 
+          <span className="hidden lg:inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-[#0B251B] text-[#87bda4] border border-[#174D3A]">
+            <span className="w-1.5 h-1.5 rounded-full bg-[#3ECF8E] animate-pulse"></span>
+            Supabase Live
+          </span>
+
           <span className="hidden md:inline-flex text-[11px] text-[#87bda4]">
             {activeDriverCount.toLocaleString()} Active EVs Online
           </span>
